@@ -1,6 +1,7 @@
 #ifndef PIECE_TABLE_H
 #define PIECE_TABLE_H
 
+#include <cassert>
 #include <span>
 #include <string>
 #include <type_traits>
@@ -19,19 +20,18 @@ struct PieceTablePosition {
 };
 
 template <typename BlockSequenceT>
-PieceTablePosition<typename BlockSequenceT::iterator>
-getPositionInTable(BlockSequenceT const & blocks, size_t idx) {
+auto getPositionInTable(BlockSequenceT && blocks, size_t idx){
     auto it = std::begin(blocks);
 
     for (; it != std::end(blocks); ++it) {
         PieceTableBlock const& b = *it;
         if (b.size > idx) {
-            return {b.start + idx, it};
+            return PieceTablePosition{b.start + idx, it};
         }
         idx -= b.size;
     }
 
-    return {idx, it};
+    return PieceTablePosition{idx, it};
 }
 
 template <
@@ -40,9 +40,10 @@ template <
     typename AppendBufferT,
     typename BlockSequenceT >
 class PieceTable {
-    static_assert(std::is_same_v<OriginalBufferT::value_type, CharT>);
-    static_assert(std::is_same_v<AppendBufferT::value_type, CharT>);
-    static_assert(std::is_same_v<BlockSequenceT::value_type, CharT>);
+    static_assert(std::is_same_v<typename OriginalBufferT::value_type, CharT>);
+    static_assert(std::is_same_v<typename AppendBufferT::value_type, CharT>);
+    static_assert(std::is_same_v<typename BlockSequenceT::value_type,
+                                 PieceTableBlock>);
 
 public:
     using value_type = CharT;
@@ -70,16 +71,7 @@ public:
         return size();
     }
     [[nodiscard]] size_type size() const {
-        size_;
-    }
-
-    [[nodiscard]] reference operator[](size_type idx) {
-        auto position = getPositionInTable(blocks_, idx);
-        if (position.it->appended_sequence) {
-            return append_buffer_[position.idx];
-        } else {
-            return original_buffer_[position.idx];
-        }
+        return size_;
     }
 
     [[nodiscard]] const_reference operator[](size_type idx) const {
@@ -159,11 +151,19 @@ public:
         }
         else {
             auto it = split_block_at(position);
-            ++it;
             blocks_.insert(it, new_block);
         }
 
         size_ += appended_size;
+    }
+
+    void insert_range_at(size_type idx, const value_type* ptr) {
+        insert_range_at(idx, std::basic_string_view{ptr});
+    }
+
+    void insert_range_at(size_type idx,
+                         std::basic_string<value_type> const& str) {
+        insert_range_at(idx, std::basic_string_view{str});
     }
 
     void append(value_type element) {
@@ -181,9 +181,17 @@ public:
             .size = appended_size,
             .appended_sequence = true
         };
-        blocks_.insert(blocks.end(), new_block);
+        blocks_.insert(blocks_.end(), new_block);
 
         size_ += appended_size;
+    }
+
+    void append_range(const value_type* ptr) {
+        append_range(std::basic_string_view{ptr});
+    }
+
+    void append_range(std::basic_string<value_type> const& str) {
+        append_range(std::basic_string_view{str});
     }
 
     void delete_at(size_type idx) {
@@ -201,8 +209,8 @@ public:
 
         BlockSequenceT result;
         if constexpr (
-            requires(result.splice(result.end(), result,
-                                   result.begin(), result.end()))
+            requires{result.splice(result.end(), blocks_,
+                                   range.begin, range.end);}
         ) {
             result.splice(result.end(), blocks_,
                           range.begin, range.end);
@@ -218,52 +226,52 @@ public:
 
 private:
     using position_type = PieceTablePosition<typename BlockSequenceT::iterator>;
-    struct block_iterator_range {
-        BlockSequenceT::iterator begin;
-        BlockSequenceT::iterator end;
+    struct BlockIteratorRange {
+        typename BlockSequenceT::iterator begin;
+        typename BlockSequenceT::iterator end;
     };
 
-    // Splits given block into two. Returns the iterator to the first
-    BlockSequenceT::iterator split_block_at(position_type pos) {
+    // Splits given block into two.
+    // The original block becomes the left part.
+    // Returns the iterator to the right, inserted part.
+    typename BlockSequenceT::iterator split_block_at(position_type pos) {
         PieceTableBlock left_split = {
             .start = pos.it->start,
             .size = pos.idx,
-            .append_sequence = block_it->append_sequence
+            .appended_sequence = pos.it->appended_sequence
         };
 
         PieceTableBlock right_split = {
             .start = pos.it->start + pos.idx,
             .size = pos.it->size - pos.idx,
-            .append_sequence = block_it->append_sequence
+            .appended_sequence = pos.it->appended_sequence
         };
 
-        *pos.it = right_split;
-        return blocks_.insert(pos.it, left_split);
+        *pos.it = left_split;
+        return blocks_.insert(std::next(pos.it), right_split);
     }
 
-    block_iterator_range split_on_range_boundaries(size_t idx,
-                                                   std::size_t size) {
-        assert(idx + size <= size());
+    BlockIteratorRange split_on_range_boundaries(std::size_t idx,
+                                                   std::size_t count) {
+        assert(idx + count <= size_);
         auto [in_block_idx, block_it] = getPositionInTable(blocks_, idx);
 
         // if the range doesn't start on a block boundary, split it
         if (in_block_idx != 0) {
             block_it = split_block_at({in_block_idx, block_it});
-            ++block_it;
         }
 
         auto range_begin = block_it;
 
         // go past all the blocks that are fully deleted
-        while (size >= block_it->size) {
-            size -= block_it->size;
+        while (count >= block_it->size) {
+            count -= block_it->size;
             ++block_it;
         }
 
         // if the range doesn't end on a block boundary, split it
-        if (size > 0) {
-            block_it = split_block_at({size, block_it});
-            ++block_it;
+        if (count > 0) {
+            block_it = split_block_at({count, block_it});
         }
 
         auto range_end = block_it;
