@@ -7,7 +7,7 @@
 #include <type_traits>
 #include <vector>
 
-struct PieceTableBlock {
+struct Piece {
     std::size_t start;
     std::size_t size;
     bool appended_sequence;
@@ -15,41 +15,53 @@ struct PieceTableBlock {
 
 template <typename Iter>
 struct PieceTablePosition {
-    std::size_t idx;
+    std::size_t in_piece_offset;
     Iter it;
 };
 
-template <typename BlockSequenceT>
-auto getPositionInTable(BlockSequenceT && blocks, size_t idx){
-    auto it = std::begin(blocks);
+template <typename Container>
+concept Splicable = requires(Container c) {
+    { c.splice(c.end(), c, c.begin(), c.end()) };
+};
 
-    for (; it != std::end(blocks); ++it) {
-        PieceTableBlock const& b = *it;
-        if (b.size > idx) {
-            return PieceTablePosition{b.start + idx, it};
+template <typename PieceSequenceT>
+auto getPositionInTable(PieceSequenceT && pieces, std::size_t idx) {
+    auto it = std::begin(pieces);
+
+    for (; it != std::end(pieces); ++it) {
+        if (it->size > idx) {
+            break;
         }
-        idx -= b.size;
+        idx -= it->size;
     }
 
     return PieceTablePosition{idx, it};
 }
 
 template <
-    typename CharT,
     typename OriginalBufferT,
     typename AppendBufferT,
-    typename BlockSequenceT >
+    typename PieceSequenceT >
 class PieceTable {
-    static_assert(std::is_same_v<typename OriginalBufferT::value_type, CharT>);
-    static_assert(std::is_same_v<typename AppendBufferT::value_type, CharT>);
-    static_assert(std::is_same_v<typename BlockSequenceT::value_type,
-                                 PieceTableBlock>);
+    static_assert(std::is_same_v<typename OriginalBufferT::value_type,
+                                 typename AppendBufferT::value_type>);
+    static_assert(std::is_same_v<typename PieceSequenceT::value_type,
+                                 Piece>);
 
 public:
-    using value_type = CharT;
-    using reference = value_type&;
-    using const_reference = value_type const&;
+    using value_type = OriginalBufferT::value_type;
     using size_type = std::size_t;
+
+    using piece_sequence_index = std::conditional_t<
+        Splicable<PieceSequenceT>,
+        typename PieceSequenceT::iterator,
+        typename PieceSequenceT::size_type>;
+
+    struct UndoPack {
+        piece_sequence_index begin;
+        piece_sequence_index end;
+        PieceSequenceT data;
+    };
 
     PieceTable() = default;
     PieceTable(const PieceTable&) = default;
@@ -60,11 +72,11 @@ public:
 
     PieceTable(OriginalBufferT original_buffer)
         : original_buffer_{original_buffer}
-        , blocks_{{0, std::size(original_buffer), false}}
+        , pieces_{{0, std::size(original_buffer), false}}
         , size_{std::size(original_buffer)} {}
 
     [[nodiscard]] bool is_empty() const {
-        return blocks_.empty();
+        return pieces_.empty();
     }
 
     [[nodiscard]] size_type length() const {
@@ -74,29 +86,20 @@ public:
         return size_;
     }
 
-    [[nodiscard]] const_reference operator[](size_type idx) const {
-        auto position = getPositionInTable(blocks_, idx);
-        if (position.it->appended_sequence) {
-            return append_buffer_[position.idx];
-        } else {
-            return original_buffer_[position.idx];
-        }
-    }
-
     void copy_data_to_span(std::span<value_type> out_span) const {
         assert(out_span.size() == size());
         std::size_t copied_count = 0;
 
-        for (PieceTableBlock const & b : blocks_) {
+        for (const Piece& b : pieces_) {
             if (b.appended_sequence) {
-                const auto block_begin = std::begin(append_buffer_) + b.start;
-                const auto block_end = block_begin + b.size;
-                std::copy(block_begin, block_end,
+                const auto piece_begin = std::begin(append_buffer_) + b.start;
+                const auto piece_end = piece_begin + b.size;
+                std::copy(piece_begin, piece_end,
                           std::begin(out_span) + copied_count);
             } else {
-                const auto block_begin = std::begin(original_buffer_) + b.start;
-                const auto block_end = block_begin + b.size;
-                std::copy(block_begin, block_end,
+                const auto piece_begin = std::begin(original_buffer_) + b.start;
+                const auto piece_end = piece_begin + b.size;
+                std::copy(piece_begin, piece_end,
                           std::begin(out_span) + copied_count);
             }
 
@@ -116,171 +119,274 @@ public:
         return result;
     }
 
-    void clear() {
-        original_buffer_.clear();
-        append_buffer_.clear();
-        blocks_.clear();
+    UndoPack clear() {
         size_ = 0;
+        return replace_piece_range_with(std::begin(pieces_), std::end(pieces_),
+                                        std::span<Piece>{});
     }
 
-    void insert_at(size_type idx, value_type element) {
+    UndoPack insert_at(size_type idx, value_type element) {
         std::basic_string_view<value_type> element_view{&element, 1};
-        insert_range_at(idx, element_view);
+        return insert_range_at(idx, element_view);
     }
 
     template<typename InputRange>
-    void insert_range_at(size_type idx, InputRange const& range) {
+    UndoPack insert_range_at(size_type idx, InputRange&& range) {
+        check_indices(idx);
         if (idx == size_) {
-            append_range(range);
-            return;
+            return append_range(std::forward<InputRange>(range));
         }
 
-        auto const position = getPositionInTable(blocks_, idx);
-        std::size_t const appended_size = std::size(range);
+        const auto position = getPositionInTable(pieces_, idx);
+        const std::size_t appended_size = std::size(range);
         append_buffer_.insert(std::end(append_buffer_),
                               std::begin(range), std::end(range));
 
-        PieceTableBlock new_block {
+        Piece new_piece {
             .start = append_buffer_.size() - appended_size,
             .size = appended_size,
             .appended_sequence = true
         };
 
-        if (position.idx == 0) {
-            blocks_.insert(position.it, new_block);
+        size_ += appended_size;
+
+        if (position.in_piece_offset == 0) {
+            // insertion between pieces, no need to split
+            auto it = pieces_.insert(position.it, new_piece);
+            return UndoPack {
+                .begin = it,
+                .end = std::next(it),
+                .data = {},
+            };
         }
         else {
-            auto it = split_block_at(position);
-            blocks_.insert(it, new_block);
+            // insertion in the middle of the piece
+            // split the piece, extract the old one, add 3 new
+            auto split_piece = split_piece_at(position);
+            Piece inserted[3] {
+                split_piece.parts[0],
+                new_piece,
+                split_piece.parts[1]
+            };
+            return replace_piece_range_with(position.it, std::next(position.it),
+                                            std::span{inserted});
         }
-
-        size_ += appended_size;
     }
 
-    void insert_range_at(size_type idx, const value_type* ptr) {
-        insert_range_at(idx, std::basic_string_view{ptr});
+    UndoPack insert_range_at(size_type idx, const value_type* ptr) {
+        return insert_range_at(idx, std::basic_string_view{ptr});
     }
 
-    void insert_range_at(size_type idx,
-                         std::basic_string<value_type> const& str) {
-        insert_range_at(idx, std::basic_string_view{str});
+    UndoPack insert_range_at(size_type idx,
+                             const std::basic_string<value_type>& str) {
+        return insert_range_at(idx, std::basic_string_view{str});
     }
 
-    void append(value_type element) {
+    UndoPack append(value_type element) {
         std::basic_string_view<value_type> element_view{&element, 1};
-        append_range(element_view);
+        return append_range(element_view);
     }
 
     template<typename InputRange>
-    void append_range(const InputRange& range) {
-        std::size_t const appended_size = std::size(range);
+    UndoPack append_range(InputRange&& range) {
+        const std::size_t appended_size = std::size(range);
 
-        append_buffer_.insert(std::end(append_buffer_), std::begin(range), std::end(range));
-        PieceTableBlock new_block {
+        append_buffer_.insert(std::end(append_buffer_),
+                              std::begin(range), std::end(range));
+        Piece new_piece {
             .start = append_buffer_.size() - appended_size,
             .size = appended_size,
             .appended_sequence = true
         };
-        blocks_.insert(blocks_.end(), new_block);
+        auto inserted = pieces_.insert(std::end(pieces_), new_piece);
 
         size_ += appended_size;
+
+        return UndoPack {
+            .begin = inserted,
+            .end = std::next(inserted),
+            .data = {}
+        };
     }
 
-    void append_range(const value_type* ptr) {
-        append_range(std::basic_string_view{ptr});
+    UndoPack append_range(const value_type* ptr) {
+        return append_range(std::basic_string_view{ptr});
     }
 
-    void append_range(std::basic_string<value_type> const& str) {
-        append_range(std::basic_string_view{str});
+    UndoPack append_range(const std::basic_string<value_type>& str) {
+        return append_range(std::basic_string_view{str});
     }
 
-    void delete_at(size_type idx) {
-        delete_range(idx, 1);
+    UndoPack delete_at(size_type idx) {
+        return delete_range_at(idx, 1);
     }
 
-    void delete_range(size_type idx, size_type delete_count) {
-        auto range = split_on_range_boundaries(idx, delete_count);
-        blocks_.erase(range.begin, range.end);
-        size_ -= delete_count;
-    }
+    UndoPack delete_range_at(size_type idx, size_type count) {
+        check_indices(idx, count);
+        size_ -= count;
+        auto [in_piece_offset, piece_it] = getPositionInTable(pieces_, idx);
 
-    BlockSequenceT extract_range(size_type idx, size_type extract_count) {
-        auto range = split_on_range_boundaries(idx, extract_count);
+        // [ 0 ] - [ 1 ] - [ 2 ] - [ 3 ] - [ 4 ] - [ 5 ]
 
-        BlockSequenceT result;
-        if constexpr (
-            requires{result.splice(result.end(), blocks_,
-                                   range.begin, range.end);}
-        ) {
-            result.splice(result.end(), blocks_,
-                          range.begin, range.end);
+        Piece cut_border_pieces[2]; // intentionally uninitialized
+        auto cut_begin = cut_border_pieces + 0;
+        auto cut_end = cut_border_pieces + 2;
+
+        const auto range_begin = piece_it;
+
+        // if the range doesn't start on a piece boundary, split it
+        // [ 0 ] - [ 1 ] - [ 2 ] - [ 3 ] - [ 4 ] - [ 5 ]
+        //       [1a] [1b]
+        //        ^ cut border piece
+        if (in_piece_offset != 0) {
+            cut_border_pieces[0]
+                = split_piece_at({in_piece_offset, piece_it}).parts[0];
+
+            const size_t to_piece_end = piece_it->size - in_piece_offset;
+
+            // let's move on to the next piece *only* if the cut part goes past
+            if (to_piece_end <= count) {
+                count -= to_piece_end;
+                in_piece_offset = 0;
+                ++piece_it;
+            }
         }
         else {
-            result.insert(result.end(),
-                          range.begin, range.end);
-            blocks_.erase(range.begin, range.end);
+            // no piece to be cut from the left side
+            ++cut_begin;
         }
 
-        size_ -= extract_count;
+        // go past all the pieces that are fully deleted
+        while (count >= piece_it->size) {
+            count -= piece_it->size;
+            ++piece_it;
+        }
+
+        // if the range doesn't end on a piece boundary, split it
+        // [ 0 ] - [ 1 ] - [ 2 ] - [ 3 ] - [ 4 ] - [ 5 ]
+        //                               [4a] [4b]
+        //                    cut border piece ^
+        if (count > 0) {
+            cut_border_pieces[1]
+                = split_piece_at({in_piece_offset + count, piece_it}).parts[1];
+            ++piece_it;
+        }
+        else {
+            --cut_end;
+        }
+
+        const auto range_end = piece_it;
+
+        // extract the range of modified pieces
+        // [ 0 ] -snip- [ 1 ] - [ 2 ] - [ 3 ] - [ 4 ] -snip- [ 5 ]
+        //    range_begin ^                          range_end ^
+        // insert cut border pieces in its place
+        // [ 0 ] - [ 1a ] - [ 4b ] - [ 5 ]
+        // undo.begin^             ^undo.end
+
+        return replace_piece_range_with(range_begin, range_end,
+                                        std::span(cut_begin, cut_end));
+    }
+
+    UndoPack undo(UndoPack&& undo) {
+        const size_type undo_length = get_part_size(std::begin(undo.data),
+                                                    std::end(undo.data));
+        UndoPack redo;
+        if constexpr (Splicable<PieceSequenceT>) {
+            // undo.begin, undo.end are persistent iterators to pieces_
+            redo.data.splice(std::end(redo.data), pieces_, undo.begin, undo.end);
+            // If the spliced-in part is empty, we need .begin = .end.
+            // We can't just use std::begin(undo.data) - cause it would point
+            // to std::end(undo.data), which as sentinel node is not sliced
+            // into pieces_
+            redo.begin = std::empty(undo.data) ? undo.end : std::begin(undo.data);
+            pieces_.splice(undo.end, undo.data);
+            redo.end = undo.end;
+        }
+        else {
+            redo = replace_piece_range_with(redo.begin, redo.end, redo.data);
+        }
+
+        size_ = size_ + undo_length - get_part_size(std::begin(redo.data),
+                                                    std::end(redo.data));
+        return redo;
     }
 
 private:
-    using position_type = PieceTablePosition<typename BlockSequenceT::iterator>;
-    struct BlockIteratorRange {
-        typename BlockSequenceT::iterator begin;
-        typename BlockSequenceT::iterator end;
+    using position_type = PieceTablePosition<typename PieceSequenceT::iterator>;
+
+    struct SplitBlock {
+        Piece parts[2];
     };
 
-    // Splits given block into two.
-    // The original block becomes the left part.
-    // Returns the iterator to the right, inserted part.
-    typename BlockSequenceT::iterator split_block_at(position_type pos) {
-        PieceTableBlock left_split = {
-            .start = pos.it->start,
-            .size = pos.idx,
-            .appended_sequence = pos.it->appended_sequence
-        };
-
-        PieceTableBlock right_split = {
-            .start = pos.it->start + pos.idx,
-            .size = pos.it->size - pos.idx,
-            .appended_sequence = pos.it->appended_sequence
-        };
-
-        *pos.it = left_split;
-        return blocks_.insert(std::next(pos.it), right_split);
+    void check_indices(size_type idx, size_type count = 0) const {
+        assert(idx <= size_);
+        assert(count <= size_);
+        assert(idx + count <= size_);
     }
 
-    BlockIteratorRange split_on_range_boundaries(std::size_t idx,
-                                                   std::size_t count) {
-        assert(idx + count <= size_);
-        auto [in_block_idx, block_it] = getPositionInTable(blocks_, idx);
+    template <typename PieceIt>
+    size_type get_part_size(PieceIt begin, PieceIt end) const {
+        size_type size = 0;
+        for (auto it = begin; it != end; ++it) {
+            size += it->size;
+        }
+        return size;
+    }
 
-        // if the range doesn't start on a block boundary, split it
-        if (in_block_idx != 0) {
-            block_it = split_block_at({in_block_idx, block_it});
+    template <typename Range>
+    UndoPack replace_piece_range_with(
+            PieceSequenceT::iterator begin,
+            PieceSequenceT::iterator end,
+            Range&& elements) {
+        UndoPack undo;
+
+        if constexpr (Splicable<PieceSequenceT>) {
+            // it's a splicable sequence (likely a list),
+            // cut the piece nodes out
+            undo.data.splice(undo.data.end(), pieces_, begin, end);
+            // save iterators as undo/redo boundaries (they are not invalidated)
+            undo.begin = pieces_.insert(end, std::begin(elements), std::end(elements));
+            undo.end = end;
+        }
+        else {
+            // it's a different kind of sequence, random access (vector/deque?)
+            // let's just copy the removed piece range out
+            undo.data.assign(begin, end);
+            // save indices as undo/redo boundaries
+            undo.begin = pieces_.erase(begin, end) - std::begin(pieces_);
+            pieces_.insert(std::begin(pieces_) + undo.begin, end,
+                           std::begin(elements), std::end(elements));
+            undo.end = begin + std::size(elements);
         }
 
-        auto range_begin = block_it;
+        return undo;
+    }
 
-        // go past all the blocks that are fully deleted
-        while (count >= block_it->size) {
-            count -= block_it->size;
-            ++block_it;
-        }
+    // Splits given piece into two.
+    // Doesn't modify the piece chain.
+    // Returns the split pair
+    static SplitBlock split_piece_at(position_type pos) {
+        assert(pos.in_piece_offset < pos.it->size);
 
-        // if the range doesn't end on a block boundary, split it
-        if (count > 0) {
-            block_it = split_block_at({count, block_it});
-        }
+        Piece left_split = {
+            .start = pos.it->start,
+            .size = pos.in_piece_offset,
+            .appended_sequence = pos.it->appended_sequence
+        };
 
-        auto range_end = block_it;
-        return {range_begin, range_end};
+        Piece right_split = {
+            .start = pos.it->start + pos.in_piece_offset,
+            .size = pos.it->size - pos.in_piece_offset,
+            .appended_sequence = pos.it->appended_sequence
+        };
+
+        return {left_split, right_split};
     }
 
     OriginalBufferT original_buffer_;
     AppendBufferT append_buffer_;
-    BlockSequenceT blocks_;
+    PieceSequenceT pieces_;
     size_type size_= 0;
 };
 
